@@ -15,7 +15,13 @@ h1, .serif { font-family: "Instrument Serif", Georgia, serif; font-weight: 400; 
 .card {
   break-inside: avoid; background: var(--card); border: 1px solid var(--line);
   border-radius: 18px; padding: 16px; margin: 0 0 14px; cursor: pointer;
+  position: relative;
 }
+.badge {
+  position: absolute; top: 12px; right: 12px; font-size: 11px; line-height: 1;
+  padding: 4px 8px; border-radius: 999px; background: var(--line); color: var(--muted);
+}
+.badge.open { background: var(--rose); color: #fff; }
 .card h3 { margin: 0 0 6px; font-family: "Instrument Serif", serif; font-size: 1.4rem; }
 .tag { font-size: 12px; color: var(--muted); }
 .fab {

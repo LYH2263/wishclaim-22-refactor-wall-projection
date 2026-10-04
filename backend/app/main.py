@@ -4,7 +4,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from app import seed
 from app.db import connect
-from app.engines.claim_lock import claim_allowed, lock_payload, release_if_expired
+from app.engines.claim_lock import claim_allowed, lock_payload
+from app.modules import wish_store as store
+from app.modules.wall_projection import project_card, project_cards
 
 app = FastAPI(title="Wishclaim", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -14,31 +16,34 @@ def _startup(): seed.init_db()
 
 def now(): return datetime.now(timezone.utc)
 
-def ttl():
-    c = connect(); row = c.execute("SELECT value FROM settings WHERE key='ttl_seconds'").fetchone(); c.close()
-    return int(row["value"] if row else 86400)
+def _swept_conn(ts: datetime):
+    """Open a connection, release expired locks with one timestamp, commit.
 
-def sweep(c):
-    for r in c.execute("SELECT * FROM wishes WHERE status='claimed'"):
-        rel = release_if_expired(r["status"], r["expires_at"], now())
-        if rel:
-            c.execute("UPDATE wishes SET status=?, claimer=?, claimed_at=?, expires_at=? WHERE id=?",
-                      (rel["status"], None, None, None, r["id"]))
+    Every read (list/detail/mine) and the claim write-path go through this, so
+    a TTL release is persisted before any card is projected, so wall and
+    detail share exactly the same status view.
+    """
+    c = connect()
+    store.sweep_expired(c, ts)
+    c.commit()
+    return c
 
 @app.get("/api/health")
 def health(): return {"ok": True, "project": "wishclaim"}
 
 @app.get("/api/wishes")
 def list_wishes():
-    c = connect(); sweep(c); c.commit()
-    rows = [dict(r) for r in c.execute("SELECT * FROM wishes ORDER BY id DESC")]; c.close(); return rows
+    ts = now()
+    c = _swept_conn(ts)
+    cards = project_cards(store.list_wishes(c), ts); c.close(); return cards
 
 @app.get("/api/wishes/{wid}")
 def get_wish(wid: int):
-    c = connect(); sweep(c); c.commit()
-    r = c.execute("SELECT * FROM wishes WHERE id=?", (wid,)).fetchone(); c.close()
-    if not r: raise HTTPException(404, "not found")
-    return dict(r)
+    ts = now()
+    c = _swept_conn(ts)
+    dto = store.get_wish(c, wid); c.close()
+    if not dto: raise HTTPException(404, "not found")
+    return project_card(dto, ts)
 
 class WishIn(BaseModel):
     title: str
@@ -47,59 +52,80 @@ class WishIn(BaseModel):
 @app.post("/api/wishes")
 def create_wish(body: WishIn):
     c = connect()
-    cur = c.execute("INSERT INTO wishes(title,note,status,data_quality) VALUES (?,?,?,?)",
-                    (body.title, body.note, "open", "clean"))
-    c.commit(); wid = cur.lastrowid; c.close(); return {"id": wid}
+    wid = store.insert_wish(c, body.title, body.note)
+    c.commit(); c.close(); return {"id": wid}
+
+class WishPatch(BaseModel):
+    title: str
+
+@app.patch("/api/wishes/{wid}")
+def patch_wish(wid: int, body: WishPatch):
+    ts = now()
+    c = _swept_conn(ts)
+    dto = store.get_wish(c, wid)
+    if not dto: c.close(); raise HTTPException(404, "not found")
+    store.update_title(c, wid, body.title); c.commit()
+    dto = store.get_wish(c, wid); c.close()
+    return project_card(dto, ts)  # wall and detail read this same card
 
 class ClaimIn(BaseModel):
     claimer: str
 
 @app.post("/api/wishes/{wid}/claim")
 def claim(wid: int, body: ClaimIn):
-    c = connect(); sweep(c); c.commit()
-    r = c.execute("SELECT * FROM wishes WHERE id=?", (wid,)).fetchone()
-    if not r: c.close(); raise HTTPException(404, "not found")
-    allowed = claim_allowed(r["status"], r["claimer"], now(), r["expires_at"])
+    ts = now()
+    c = _swept_conn(ts)
+    dto = store.get_wish(c, wid)
+    if not dto: c.close(); raise HTTPException(404, "not found")
+    allowed = claim_allowed(dto["status"], dto["claimer"], ts, dto["expires_at"])
     if not allowed["ok"]:
         c.close(); raise HTTPException(409, allowed["reason"])
-    p = lock_payload(body.claimer, now(), ttl())
-    c.execute("UPDATE wishes SET status=?, claimer=?, claimed_at=?, expires_at=? WHERE id=?",
-              (p["status"], p["claimer"], p["claimed_at"], p["expires_at"], wid))
-    c.commit(); c.close(); return p
+    store.apply_lock(c, wid, lock_payload(body.claimer, ts, store.ttl_seconds()))
+    c.commit()
+    dto = store.get_wish(c, wid); c.close()
+    return project_card(dto, ts)
 
 @app.post("/api/wishes/{wid}/release")
 def release(wid: int):
+    ts = now()
     c = connect()
-    r = c.execute("SELECT * FROM wishes WHERE id=?", (wid,)).fetchone()
-    if not r: c.close(); raise HTTPException(404, "not found")
-    if r["status"] != "claimed":
+    dto = store.get_wish(c, wid)
+    if not dto: c.close(); raise HTTPException(404, "not found")
+    if dto["status"] != "claimed":
         c.close(); raise HTTPException(400, "not_claimed")
-    c.execute("UPDATE wishes SET status='released', claimer=NULL, claimed_at=NULL, expires_at=NULL WHERE id=?", (wid,))
-    c.commit(); c.close(); return {"ok": True, "status": "released"}
+    store.mark_released(c, wid); c.commit()
+    dto = store.get_wish(c, wid); c.close()
+    return project_card(dto, ts)
 
 @app.post("/api/wishes/{wid}/fulfill")
 def fulfill(wid: int):
+    ts = now()
     c = connect()
-    r = c.execute("SELECT * FROM wishes WHERE id=?", (wid,)).fetchone()
-    if not r: c.close(); raise HTTPException(404, "not found")
-    if r["status"] != "claimed":
+    dto = store.get_wish(c, wid)
+    if not dto: c.close(); raise HTTPException(404, "not found")
+    if dto["status"] != "claimed":
         c.close(); raise HTTPException(400, "need_claim")
-    c.execute("UPDATE wishes SET status='fulfilled' WHERE id=?", (wid,))
-    c.commit(); c.close(); return {"ok": True, "status": "fulfilled"}
+    store.mark_fulfilled(c, wid); c.commit()
+    dto = store.get_wish(c, wid); c.close()
+    return project_card(dto, ts)
 
 @app.get("/api/mine")
 def mine(claimer: str):
-    c = connect(); sweep(c); c.commit()
-    rows = [dict(r) for r in c.execute("SELECT * FROM wishes WHERE claimer=?", (claimer,))]; c.close(); return rows
+    ts = now()
+    c = _swept_conn(ts)
+    cards = project_cards(store.list_by_claimer(c, claimer), ts); c.close(); return cards
 
 @app.get("/api/done")
 def done():
+    ts = now()
     c = connect()
-    rows = [dict(r) for r in c.execute("SELECT * FROM wishes WHERE status='fulfilled'")]; c.close(); return rows
+    cards = project_cards(store.list_fulfilled(c), ts); c.close(); return cards
 
 @app.get("/api/settings")
 def settings():
-    c = connect(); rows = {r["key"]: r["value"] for r in c.execute("SELECT * FROM settings")}; c.close(); return rows
+    c = connect()
+    rows = {r["key"]: r["value"] for r in c.execute("SELECT * FROM settings")}; c.close()
+    return rows
 
 @app.get("/api/rules")
 def rules():

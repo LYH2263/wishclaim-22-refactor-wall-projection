@@ -4,9 +4,10 @@
     <p class="tag">无顶栏 · 瀑布流 · 点卡片认领</p>
     <div class="masonry">
       <article v-for="w in rows" :key="w.id" class="card" @click="$router.push('/wishes/'+w.id)">
-        <h3>{{ w.title || '（无标题）' }}</h3>
+        <span class="badge" :class="{ open: w.claimable }">{{ w.badge }}</span>
+        <h3>{{ w.display_title }}</h3>
         <p>{{ w.note }}</p>
-        <span class="tag">{{ w.status }} · {{ w.data_quality }}</span>
+        <span class="tag">{{ w.status_text }}<template v-if="w.countdown_text"> · {{ w.countdown_text }}</template></span>
       </article>
     </div>
   </div>
