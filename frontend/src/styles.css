@@ -13,9 +13,17 @@ h1, .serif { font-family: "Instrument Serif", Georgia, serif; font-weight: 400; 
 @media (max-width: 800px) { .masonry { column-count: 2; } }
 @media (max-width: 520px) { .masonry { column-count: 1; } }
 .card {
+  position: relative;
   break-inside: avoid; background: var(--card); border: 1px solid var(--line);
   border-radius: 18px; padding: 16px; margin: 0 0 14px; cursor: pointer;
 }
+.badge {
+  position: absolute; top: 10px; right: 12px; font-size: 11px; line-height: 1;
+  padding: 4px 8px; border-radius: 999px; background: var(--line); color: var(--ink);
+}
+.badge.open { background: var(--rose); color: #fff; }
+button.mini { padding: 2px 10px; font-size: 12px; vertical-align: middle; }
+button:disabled { opacity: .5; cursor: default; }
 .card h3 { margin: 0 0 6px; font-family: "Instrument Serif", serif; font-size: 1.4rem; }
 .tag { font-size: 12px; color: var(--muted); }
 .fab {
